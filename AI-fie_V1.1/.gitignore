@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+*.jsonl
+
+# Local runtime / temp files
+temp/
+tmp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Ollama / model outputs / local data dumps
+models/
+checkpoints/
+exports/
+data/
+
+# SQLite / local DB
+*.db
+*.sqlite3
