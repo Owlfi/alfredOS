@@ -59,16 +59,19 @@ https://ollama.com
 
 ### 1. Clone the repo
 
-```bash
 git clone https://github.com/yourusername/AI-fie_V1.1.git
 cd AI-fie_V1.1
+
 2. Create virtual environment
 python -m venv venv
 venv\Scripts\activate
+
 3. Install dependencies
 pip install -r requirements.txt
+
 4. Run Ollama model
 ollama run llama3.1:8b
+
 5. Start the app
 
 (Adjust depending on your entry point)
