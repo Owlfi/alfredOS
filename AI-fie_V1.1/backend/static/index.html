@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI-fie Voice Chat</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #111;
+      color: #f5f5f5;
+    }
+
+    h1 {
+      margin-bottom: 20px;
+    }
+
+    button {
+      padding: 12px 18px;
+      margin-right: 10px;
+      margin-bottom: 20px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+
+    #startBtn {
+      background: #2e7d32;
+      color: white;
+    }
+
+    #stopBtn {
+      background: #c62828;
+      color: white;
+    }
+
+    .box {
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 15px;
+      margin-bottom: 20px;
+      white-space: pre-wrap;
+    }
+
+    .label {
+      font-weight: bold;
+      margin-bottom: 8px;
+      display: block;
+    }
+
+    audio {
+      width: 100%;
+      margin-top: 10px;
+    }
+
+    .status {
+      margin-bottom: 20px;
+      color: #bbb;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI-fie Voice Chat</h1>
+
+  <div class="status" id="status">Ready</div>
+
+  <button id="startBtn">Start Recording</button>
+  <button id="stopBtn" disabled>Stop & Send</button>
+
+  <div class="box">
+    <span class="label">Transcript</span>
+    <div id="transcript">Nothing yet</div>
+  </div>
+
+  <div class="box">
+    <span class="label">Reply</span>
+    <div id="reply">Nothing yet</div>
+  </div>
+
+  <div class="box">
+    <span class="label">Voice Response</span>
+    <audio id="audioPlayer" controls></audio>
+  </div>
+
+  <script>
+    let mediaRecorder;
+    let audioChunks = [];
+
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const transcriptEl = document.getElementById("transcript");
+    const replyEl = document.getElementById("reply");
+    const audioPlayer = document.getElementById("audioPlayer");
+    const statusEl = document.getElementById("status");
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstart = () => {
+          statusEl.textContent = "Recording...";
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+        };
+
+        mediaRecorder.onstop = async () => {
+          statusEl.textContent = "Sending audio...";
+
+          const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+          const formData = new FormData();
+          formData.append("audio", audioBlob, "recording.webm");
+
+          try {
+            const response = await fetch("/voice/chat", {
+              method: "POST",
+              body: formData
+            });
+
+            if (!response.ok) {
+              throw new Error(`Server error: ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            transcriptEl.textContent = data.transcript || "No transcript returned";
+            replyEl.textContent = data.reply || "No reply returned";
+
+            if (data.response_audio_path) {
+              const fileName = data.response_audio_path.split(/[\\/]/).pop();
+              audioPlayer.src = `/audio/${fileName}`;
+              audioPlayer.load();
+              audioPlayer.play().catch(() => {});
+            }
+
+            statusEl.textContent = "Done";
+          } catch (error) {
+            console.error(error);
+            statusEl.textContent = "Error sending audio";
+            replyEl.textContent = error.message;
+          } finally {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+          }
+        };
+
+        mediaRecorder.start();
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = "Microphone access failed";
+      }
+    });
+
+    stopBtn.addEventListener("click", () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+        statusEl.textContent = "Stopping recording...";
+      }
+    });
+  </script>
+</body>
+</html>
