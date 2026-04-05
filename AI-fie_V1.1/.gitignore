@@ -1,3 +1,6 @@
+# Review docs
+to_review/
+
 # Python
 __pycache__/
 *.py[cod]

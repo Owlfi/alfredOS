@@ -1,7 +1,8 @@
-from email.mime import message
 import json
 import os
+import re
 from datetime import datetime
+from typing import Dict, List
 
 from app.services.goal_service import get_system_mode, set_system_mode
 from app.services.journal_service import log_message_with_context
@@ -15,8 +16,8 @@ ONBOARDING_SESSION_PATH = os.path.join(MEMORY_DIR, "onboarding_session.json")
 
 print("ONBOARDING SERVICE LOADED")
 
+
 def handle_onboarding_mode(source: str, message: str) -> dict:
-    debug_log("[ONBOARDING] FUNCTION HIT")
     """
     Main onboarding entry point for chat_orchestrator.
 
@@ -26,61 +27,77 @@ def handle_onboarding_mode(source: str, message: str) -> dict:
         "reply": str
     }
     """
+    debug_log("[ONBOARDING] FUNCTION HIT")
 
-    # FORCE onboarding mode (explicit command)
-    if message.strip().lower() == "enter onboarding mode":
+    lowered = message.strip().lower()
+
+    if lowered == "enter onboarding mode":
         debug_log("[ONBOARDING] Force entering onboarding mode")
 
         session = _create_onboarding_session()
+        first_question = _generate_next_question(session)
+        first_question = _enforce_specific_question(
+            session=session,
+            candidate_question=first_question,
+            target_field_key="",
+            user_message="",
+        )
+        _append_conversation_turn(session, "assistant", first_question)
         _save_session(session)
         set_system_mode("onboarding")
 
-        first_question = _get_current_question(session)
-
         return {
             "action": "entered_onboarding_mode",
-            "reply": first_question
+            "reply": first_question,
         }
 
     current_mode = get_system_mode()
-
     debug_log(f"[ONBOARDING] Current system mode: {current_mode}")
 
-    # Trigger onboarding mode manually
     if current_mode != "onboarding" and _is_onboarding_trigger(message):
         debug_log("[ONBOARDING] Entering onboarding mode")
         session = _create_onboarding_session()
+        first_question = _generate_next_question(session)
+        first_question = _enforce_specific_question(
+            session=session,
+            candidate_question=first_question,
+            target_field_key="",
+            user_message="",
+        )
+        _append_conversation_turn(session, "assistant", first_question)
         _save_session(session)
         set_system_mode("onboarding")
 
-        first_question = _get_current_question(session)
-
         return {
             "action": "entered_onboarding_mode",
-            "reply": first_question
+            "reply": first_question,
         }
 
-    # If onboarding mode is active, capture and continue flow
     if current_mode == "onboarding":
         debug_log("[ONBOARDING] Onboarding mode is active")
 
         if not os.path.exists(ONBOARDING_SESSION_PATH):
             debug_log("[ONBOARDING] No session found, creating a new onboarding session")
             session = _create_onboarding_session()
+            first_question = _generate_next_question(session)
+            first_question = _enforce_specific_question(
+                session=session,
+                candidate_question=first_question,
+                target_field_key="",
+                user_message="",
+            )
+            _append_conversation_turn(session, "assistant", first_question)
             _save_session(session)
-
-            first_question = _get_current_question(session)
 
             return {
                 "action": "entered_onboarding_mode",
-                "reply": first_question
+                "reply": first_question,
             }
 
         session = _load_session()
 
-        # If awaiting confirmation
         if session.get("awaiting_confirmation", False):
-            if message.strip().lower() == "confirm":
+            if lowered == "confirm":
                 debug_log("[ONBOARDING] Final confirmation received")
                 _write_onboarding_files(session)
                 set_system_mode("normal")
@@ -88,32 +105,36 @@ def handle_onboarding_mode(source: str, message: str) -> dict:
 
                 return {
                     "action": "exited_onboarding_mode",
-                    "reply": "Onboarding complete. Your onboarding files have been saved."
+                    "reply": "Onboarding complete. Your project onboarding files have been saved.",
                 }
 
             debug_log("[ONBOARDING] Revising final summary based on feedback")
+            _append_conversation_turn(session, "user", message)
+
             session["final_summary"] = _revise_summary(
                 current_summary=session.get("final_summary", ""),
-                correction_feedback=message
+                correction_feedback=message,
             )
+
+            reply = (
+                f"{session['final_summary']}\n\n"
+                "Reply with 'confirm' to save it, or tell me what still needs changing."
+            )
+            _append_conversation_turn(session, "assistant", reply)
             _save_session(session)
 
             return {
                 "action": "captured_onboarding_message",
-                "reply": (
-                    f"{session['final_summary']}\n\n"
-                    "Reply with 'confirm' to save it, or tell me what still needs changing."
-                )
+                "reply": reply,
             }
 
-        # Normal question flow
-        result = _process_onboarding_answer(session, source, message)
+        result = _process_onboarding_message(session, source, message)
         _save_session(session)
         return result
 
     return {
         "action": "no_action",
-        "reply": ""
+        "reply": "",
     }
 
 
@@ -123,8 +144,10 @@ def _is_onboarding_trigger(message: str) -> bool:
         "begin onboarding",
         "i want to do onboarding",
         "let's do onboarding",
-        "setup my profile",
-        "set up my profile"
+        "setup my project",
+        "set up my project",
+        "project onboarding",
+        "start project onboarding",
     ]
     lowered = message.strip().lower()
     return lowered in trigger_phrases
@@ -137,68 +160,207 @@ def _create_onboarding_session() -> dict:
         "session_id": f"onboarding_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         "mode": "onboarding",
         "status": "in_progress",
-        "current_module_index": 0,
-        "current_question_index": 0,
+        "active_module_key": "project_definition",
         "current_followup_count": 0,
         "awaiting_confirmation": False,
         "final_summary": "",
         "created_at": now,
         "updated_at": now,
+        "conversation_history": [],
         "modules": [
             {
-                "key": "founder_profile",
-                "title": "Founder Profile",
-                "questions": [
-                    {"key": "name", "text": "What is your name?"},
-                    {"key": "current_situation", "text": "What are you currently doing?"},
-                    {"key": "strengths", "text": "What are your main strengths?"},
-                    {"key": "struggles", "text": "What do you tend to struggle with?"},
-                    {"key": "identity_direction", "text": "What kind of person are you trying to become?"},
+                "key": "project_definition",
+                "title": "Project Definition",
+                "required_fields": [
+                    {
+                        "key": "project_name",
+                        "description": "The name of the project or working label",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "project_purpose",
+                        "description": "What the project is trying to achieve",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "current_stage",
+                        "description": "What stage the project is currently in",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "why_it_matters",
+                        "description": "Why this project matters right now",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
                 ],
-                "answers": [],
-                "module_summary": ""
+                "module_summary": "",
             },
             {
-                "key": "goals",
-                "title": "Goals",
-                "questions": [
-                    {"key": "top_goals", "text": "What are your top 3 goals right now?"},
-                    {"key": "twelve_month_outcome", "text": "What are you trying to achieve in the next 12 months?"},
-                    {"key": "what_matters_now", "text": "What matters most to you right now?"},
+                "key": "current_objective",
+                "title": "Current Objective",
+                "required_fields": [
+                    {
+                        "key": "phase_goal",
+                        "description": "The main goal of the current phase",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "definition_of_done",
+                        "description": "What done looks like for this phase",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "key_deliverables",
+                        "description": "The main deliverables to produce in this phase",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "next_move",
+                        "description": "The single most important next move",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
                 ],
-                "answers": [],
-                "module_summary": ""
+                "module_summary": "",
             },
             {
-                "key": "current_focus",
-                "title": "Current Focus",
-                "questions": [
-                    {"key": "active_work", "text": "What are you currently working on?"},
-                    {"key": "weekly_priorities", "text": "What are your top 3 priorities this week?"},
-                    {"key": "current_bottleneck", "text": "What is the biggest thing slowing you down right now?"},
+                "key": "workflow_context",
+                "title": "Workflow Context",
+                "required_fields": [
+                    {
+                        "key": "current_workflow",
+                        "description": "How the work currently gets done",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "tools_used",
+                        "description": "What tools, platforms, or systems are involved",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "key_inputs",
+                        "description": "What inputs the workflow usually starts from",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "desired_outputs",
+                        "description": "What outputs the agent should help produce",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
                 ],
-                "answers": [],
-                "module_summary": ""
+                "module_summary": "",
             },
             {
-                "key": "help_preferences",
-                "title": "Help Preferences",
-                "questions": [
-                    {"key": "advice_style", "text": "Do you want direct advice or softer guidance?"},
-                    {"key": "response_style", "text": "Do you prefer short answers or detailed breakdowns?"},
-                    {"key": "challenge_level", "text": "Should I challenge weak thinking when I see it?"},
-                    {"key": "preferred_support", "text": "What kind of help is most useful to you?"},
+                "key": "constraints",
+                "title": "Constraints",
+                "required_fields": [
+                    {
+                        "key": "current_constraints",
+                        "description": "Current constraints, limits, or conditions to respect",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "out_of_scope",
+                        "description": "What should be treated as out of scope",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "risks_or_blockers",
+                        "description": "Known blockers, risks, or friction points",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
                 ],
-                "answers": [],
-                "module_summary": ""
-            }
-        ]
+                "module_summary": "",
+            },
+            {
+                "key": "support_preferences",
+                "title": "Support Preferences",
+                "required_fields": [
+                    {
+                        "key": "support_role",
+                        "description": "How the agent should behave in this project",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "response_style",
+                        "description": "Preferred response style",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "challenge_level",
+                        "description": "How directly the agent should challenge weak thinking",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                    {
+                        "key": "optimisation_priority",
+                        "description": "Whether to optimise for speed, depth, simplicity, or quality",
+                        "value": "",
+                        "confidence": "low",
+                        "status": "missing",
+                        "source_notes": [],
+                    },
+                ],
+                "module_summary": "",
+            },
+        ],
     }
 
 
-def _process_onboarding_answer(session: dict, source: str, message: str) -> dict:
-    module = session["modules"][session["current_module_index"]]
-    question = module["questions"][session["current_question_index"]]
+def _process_onboarding_message(session: dict, source: str, message: str) -> dict:
+    module = _get_active_module(session)
 
     log_message_with_context(
         source=source,
@@ -206,170 +368,488 @@ def _process_onboarding_answer(session: dict, source: str, message: str) -> dict
         message=message,
         mode="onboarding",
         module=module["key"],
-        question_key=question["key"],
-        message_type="interview_answer"
+        question_key="dynamic",
+        message_type="interview_answer",
     )
 
-    answer_record = _get_or_create_answer_record(module, question)
+    _append_conversation_turn(session, "user", message)
 
-    if not answer_record.get("raw_answer"):
-        answer_record["raw_answer"] = message
-    else:
-        answer_record.setdefault("followups", []).append(message)
+    extraction_result = _extract_and_update_fields(session, message)
+    module = _get_active_module(session)
 
-    combined_answer = _combine_answer_record(answer_record)
-    evaluation = _evaluate_answer(question["text"], combined_answer)
-    answer_record["evaluation"] = evaluation
+    if _is_module_complete(module):
+        session["current_followup_count"] = 0
+        module["module_summary"] = _generate_module_summary(module)
 
-    if evaluation.get("needs_followup") and session["current_followup_count"] < 2:
+        moved = _advance_to_next_module(session)
+
+        if moved:
+            next_question = _generate_next_question(session)
+            next_question = _enforce_specific_question(
+                session=session,
+                candidate_question=next_question,
+                target_field_key="",
+                user_message=message,
+            )
+            reply = f"Module summary:\n\n{module['module_summary']}\n\n{next_question}"
+            _append_conversation_turn(session, "assistant", reply)
+
+            return {
+                "action": "captured_onboarding_message",
+                "reply": reply,
+            }
+
+        session["awaiting_confirmation"] = True
+        session["final_summary"] = _generate_final_summary(session)
+
+        reply = (
+            f"{session['final_summary']}\n\n"
+            "Does this accurately reflect the project and how I should help? "
+            "Reply with 'confirm' to save it, or tell me what needs changing."
+        )
+        _append_conversation_turn(session, "assistant", reply)
+
+        return {
+            "action": "captured_onboarding_message",
+            "reply": reply,
+        }
+
+    if extraction_result.get("needs_followup", True) and session["current_followup_count"] < 2:
         session["current_followup_count"] += 1
-        followup = evaluation.get("followup_question") or "Can you give me a bit more detail on that?"
+        next_question = extraction_result.get("followup_question", "")
+        target_field_key = str(extraction_result.get("target_field_key", "")).strip()
+    else:
+        session["current_followup_count"] = 0
+        next_question = _generate_next_question(session)
+        target_field_key = ""
 
-        return {
-            "action": "captured_onboarding_message",
-            "reply": followup
-        }
+    next_question = _enforce_specific_question(
+        session=session,
+        candidate_question=next_question,
+        target_field_key=target_field_key,
+        user_message=message,
+    )
 
-    session["current_followup_count"] = 0
-
-    # Move to next question or module
-    if session["current_question_index"] < len(module["questions"]) - 1:
-        session["current_question_index"] += 1
-        next_question = _get_current_question(session)
-
-        return {
-            "action": "captured_onboarding_message",
-            "reply": next_question
-        }
-
-    # Module complete
-    module["module_summary"] = _generate_module_summary(module)
-
-    if session["current_module_index"] < len(session["modules"]) - 1:
-        session["current_module_index"] += 1
-        session["current_question_index"] = 0
-        next_question = _get_current_question(session)
-
-        return {
-            "action": "captured_onboarding_message",
-            "reply": f"Module summary:\n\n{module['module_summary']}\n\n{next_question}"
-        }
-
-    # Final summary
-    session["awaiting_confirmation"] = True
-    session["final_summary"] = _generate_final_summary(session)
+    _append_conversation_turn(session, "assistant", next_question)
 
     return {
         "action": "captured_onboarding_message",
-        "reply": (
-            f"{session['final_summary']}\n\n"
-            "Does this accurately reflect your current situation and direction? "
-            "Reply with 'confirm' to save it, or tell me what needs changing."
+        "reply": next_question,
+    }
+
+
+def _get_active_module(session: dict) -> dict:
+    active_key = session["active_module_key"]
+    for module in session["modules"]:
+        if module["key"] == active_key:
+            return module
+    raise ValueError(f"Active module not found: {active_key}")
+
+
+def _append_conversation_turn(session: dict, role: str, message: str, max_turns: int = 10) -> None:
+    session.setdefault("conversation_history", []).append(
+        {
+            "role": role,
+            "message": message,
+        }
+    )
+
+    if len(session["conversation_history"]) > max_turns:
+        session["conversation_history"] = session["conversation_history"][-max_turns:]
+
+
+def _get_last_user_message(session: dict) -> str:
+    history = session.get("conversation_history", [])
+    for turn in reversed(history):
+        if turn.get("role") == "user":
+            return turn.get("message", "")
+    return ""
+
+
+def _get_missing_fields(module: dict) -> List[dict]:
+    missing = []
+    for field in module.get("required_fields", []):
+        if not (
+            field.get("status") == "filled"
+            and field.get("confidence") in ["medium", "high"]
+        ):
+            missing.append(field)
+    return missing
+
+
+def _is_module_complete(module: dict) -> bool:
+    return len(_get_missing_fields(module)) == 0
+
+
+def _advance_to_next_module(session: dict) -> bool:
+    module_keys = [module["key"] for module in session["modules"]]
+    current_key = session["active_module_key"]
+
+    try:
+        idx = module_keys.index(current_key)
+    except ValueError:
+        return False
+
+    if idx < len(module_keys) - 1:
+        session["active_module_key"] = module_keys[idx + 1]
+        session["current_followup_count"] = 0
+        return True
+
+    return False
+
+
+def _extract_and_update_fields(session: dict, user_message: str) -> dict:
+    module = _get_active_module(session)
+
+    fields_for_prompt = []
+    for field in module["required_fields"]:
+        fields_for_prompt.append(
+            {
+                "key": field["key"],
+                "description": field["description"],
+                "current_value": field["value"],
+                "current_confidence": field["confidence"],
+                "status": field["status"],
+            }
         )
-    }
 
+    recent_turns = session.get("conversation_history", [])[-6:]
 
-def _get_current_question(session: dict) -> str:
-    module = session["modules"][session["current_module_index"]]
-    question = module["questions"][session["current_question_index"]]
-    return question["text"]
-
-
-def _get_or_create_answer_record(module: dict, question: dict) -> dict:
-    for answer in module["answers"]:
-        if answer["question_key"] == question["key"]:
-            return answer
-
-    new_record = {
-        "question_key": question["key"],
-        "question_text": question["text"],
-        "raw_answer": "",
-        "followups": [],
-        "evaluation": {}
-    }
-    module["answers"].append(new_record)
-    return new_record
-
-
-def _combine_answer_record(answer_record: dict) -> str:
-    parts = []
-    if answer_record.get("raw_answer"):
-        parts.append(answer_record["raw_answer"])
-    parts.extend(answer_record.get("followups", []))
-    return "\n".join(parts).strip()
-
-
-def _evaluate_answer(question_text: str, answer_text: str) -> dict:
     prompt = f"""
-You are evaluating a user's answer in an onboarding interview.
+You are updating a structured onboarding session for a project-specific AI assistant.
 
-Question:
-{question_text}
+Current module:
+{module['title']}
 
-User answer:
-{answer_text}
+Required fields:
+{json.dumps(fields_for_prompt, indent=2)}
+
+Recent conversation:
+{json.dumps(recent_turns, indent=2)}
+
+Latest user message:
+{user_message}
 
 Your job:
-1. Decide whether the answer actually addresses the question.
-2. Judge whether it is specific enough to be useful.
-3. Judge whether it is complete enough to move on.
-4. If not complete, propose one short follow-up question.
-5. Extract the factual points given by the user.
+1. Extract useful facts from the user's latest message.
+2. Update any fields that now have enough information.
+3. Leave fields unchanged if the message does not clearly support them.
+4. Mark confidence as low, medium, or high.
+5. Mark each field status as either missing or filled.
+6. Decide whether a follow-up is still needed in this module.
+7. If a follow-up is needed, it MUST be specific.
+8. The follow-up question MUST clearly connect to something the user just said or to an obviously missing project detail.
+9. When possible, start from something the user already mentioned and extend it into the next missing detail.
+10. Do NOT ask vague questions like "Can you tell me a bit more about that?"
+11. Do NOT repeat information already known with medium or high confidence.
+12. Prefer asking about the single most important missing field.
+13. Stay grounded in the user's wording.
+14. Return valid JSON only.
 
-Rules:
-- Do not give advice.
-- Do not rewrite the user's intent.
-- Stay grounded in the user's wording.
-- Be conservative with follow-ups.
-- Return valid JSON only.
-
-Return JSON with this schema only:
+Return JSON in this schema:
 {{
-  "answered_question": true,
-  "specificity": "high",
-  "completeness": "medium",
-  "confidence_to_move_on": "medium",
+  "field_updates": [
+    {{
+      "key": "example_field",
+      "value": "example value",
+      "confidence": "medium",
+      "status": "filled",
+      "source_note": "Short note about why this field was updated."
+    }}
+  ],
   "needs_followup": true,
-  "followup_question": "Can you give me one or two specific examples?",
-  "extracted_facts": ["example fact 1", "example fact 2"]
+  "followup_question": "One specific natural next question.",
+  "target_field_key": "the_main_field_this_question_is_trying_to_fill",
+  "reasoning_note": "Short note about what is still missing."
 }}
 """.strip()
 
     raw = call_ollama(prompt)
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except Exception:
+        debug_log("[ONBOARDING] Failed to parse field extraction JSON")
         return {
-            "answered_question": True,
-            "specificity": "medium",
-            "completeness": "medium",
-            "confidence_to_move_on": "medium",
-            "needs_followup": False,
-            "followup_question": "",
-            "extracted_facts": []
+            "field_updates": [],
+            "needs_followup": True,
+            "followup_question": _build_specific_fallback_question(
+                module=module,
+                target_field_key="",
+                user_message=user_message,
+            ),
+            "target_field_key": "",
+            "reasoning_note": "Fallback due to JSON parse failure.",
         }
+
+    updates_by_key = {u["key"]: u for u in parsed.get("field_updates", []) if u.get("key")}
+
+    for field in module["required_fields"]:
+        update = updates_by_key.get(field["key"])
+        if not update:
+            continue
+
+        new_value = str(update.get("value", field["value"])).strip()
+        if new_value:
+            field["value"] = new_value
+
+        confidence = str(update.get("confidence", field["confidence"])).lower().strip()
+        if confidence in ["low", "medium", "high"]:
+            field["confidence"] = confidence
+
+        status = str(update.get("status", field["status"])).lower().strip()
+        if status in ["missing", "filled"]:
+            field["status"] = status
+
+        source_note = str(update.get("source_note", "")).strip()
+        if source_note:
+            field.setdefault("source_notes", []).append(source_note)
+
+    followup_question = str(parsed.get("followup_question", "")).strip()
+    target_field_key = str(parsed.get("target_field_key", "")).strip()
+
+    if parsed.get("needs_followup", True):
+        parsed["followup_question"] = _enforce_specific_question(
+            session=session,
+            candidate_question=followup_question,
+            target_field_key=target_field_key,
+            user_message=user_message,
+        )
+
+    return parsed
+
+
+def _generate_next_question(session: dict) -> str:
+    module = _get_active_module(session)
+    missing_fields = _get_missing_fields(module)
+
+    required_fields = []
+    for field in module["required_fields"]:
+        required_fields.append(
+            {
+                "key": field["key"],
+                "description": field["description"],
+                "value": field["value"],
+                "confidence": field["confidence"],
+                "status": field["status"],
+            }
+        )
+
+    prompt_missing_fields = []
+    for field in missing_fields:
+        prompt_missing_fields.append(
+            {
+                "key": field["key"],
+                "description": field["description"],
+                "value": field["value"],
+                "confidence": field["confidence"],
+                "status": field["status"],
+            }
+        )
+
+    recent_turns = session.get("conversation_history", [])[-6:]
+
+    prompt = f"""
+You are guiding a conversational onboarding flow for a project-specific AI assistant.
+
+Current module:
+{module['title']}
+
+All required fields:
+{json.dumps(required_fields, indent=2)}
+
+Missing or weak fields:
+{json.dumps(prompt_missing_fields, indent=2)}
+
+Recent conversation:
+{json.dumps(recent_turns, indent=2)}
+
+Your job:
+- Ask the single best next question for this module.
+- Make it specific.
+- Make it sound natural and conversational.
+- Link it to what the user has already said where possible.
+- When possible, start from something the user already mentioned and extend it into the next missing detail.
+- Focus on the most important missing field.
+- Do not sound like a generic form.
+- Do not ask vague questions like "Can you tell me a bit more about that?"
+- Do not repeat information already known with medium or high confidence.
+- Ask one question only.
+- Output plain text only.
+
+Next question:
+""".strip()
+
+    question = call_ollama(prompt).strip()
+
+    primary_missing_key = ""
+    if missing_fields:
+        primary_missing_key = missing_fields[0]["key"]
+
+    return _enforce_specific_question(
+        session=session,
+        candidate_question=question,
+        target_field_key=primary_missing_key,
+        user_message=_get_last_user_message(session),
+    )
+
+
+def _is_generic_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+
+    if not q:
+        return True
+
+    generic_patterns = [
+        r"^can you tell me a bit more about that\??$",
+        r"^can you tell me more about that\??$",
+        r"^could you tell me a bit more about that\??$",
+        r"^could you tell me more about that\??$",
+        r"^tell me more about that\??$",
+        r"^can you expand on that\??$",
+        r"^could you expand on that\??$",
+        r"^can you elaborate\??$",
+        r"^could you elaborate\??$",
+        r"^can you give me more detail\??$",
+        r"^could you give me more detail\??$",
+        r"^can you explain that a bit more\??$",
+        r"^could you explain that a bit more\??$",
+        r"^can you clarify that\??$",
+        r"^could you clarify that\??$",
+        r"^what do you mean by that\??$",
+    ]
+
+    for pattern in generic_patterns:
+        if re.match(pattern, q):
+            return True
+
+    vague_fragments = [
+        "tell me more about that",
+        "bit more about that",
+        "expand on that",
+        "elaborate on that",
+        "give me more detail",
+        "clarify that",
+        "explain that a bit more",
+    ]
+
+    if any(fragment in q for fragment in vague_fragments):
+        return True
+
+    return False
+
+
+def _enforce_specific_question(
+    session: dict,
+    candidate_question: str,
+    target_field_key: str = "",
+    user_message: str = "",
+) -> str:
+    module = _get_active_module(session)
+
+    if not _is_generic_question(candidate_question):
+        return candidate_question.strip()
+
+    return _build_specific_fallback_question(
+        module=module,
+        target_field_key=target_field_key,
+        user_message=user_message,
+    )
+
+
+def _build_specific_fallback_question(
+    module: dict,
+    target_field_key: str = "",
+    user_message: str = "",
+) -> str:
+    missing_fields = _get_missing_fields(module)
+
+    if not missing_fields:
+        return "What is the most important thing I still need to understand about this project?"
+
+    target_field = None
+
+    if target_field_key:
+        for field in missing_fields:
+            if field["key"] == target_field_key:
+                target_field = field
+                break
+
+    if target_field is None:
+        target_field = missing_fields[0]
+
+    key = target_field["key"]
+    user_text = (user_message or "").strip()
+
+    fallback_map = {
+        "project_name": "What are you calling this project at the moment?",
+        "project_purpose": "What is this project trying to achieve overall?",
+        "current_stage": "Where is this project up to right now?",
+        "why_it_matters": "Why does this project matter to you right now?",
+        "phase_goal": "What is the main goal of the current phase?",
+        "definition_of_done": "What would 'done' look like for this phase?",
+        "key_deliverables": "What are the main things you want produced in this phase?",
+        "next_move": "What is the single most important next step from here?",
+        "current_workflow": "How are you currently doing this work from start to finish?",
+        "tools_used": "What tools or platforms are already part of this workflow?",
+        "key_inputs": "What do you usually start with when this workflow begins?",
+        "desired_outputs": "What outputs do you want the agent to help create?",
+        "current_constraints": "What constraints or limits do I need to respect here?",
+        "out_of_scope": "What should I treat as out of scope for this phase?",
+        "risks_or_blockers": "What is currently slowing this down or getting in the way?",
+        "support_role": "How do you want me to help in this project — more like a strategist, operator, reviewer, or thought partner?",
+        "response_style": "Do you want short answers, detailed breakdowns, or step-by-step help for this project?",
+        "challenge_level": "Should I challenge weak logic directly when I see it in this project?",
+        "optimisation_priority": "Should I optimise more for speed, depth, simplicity, or quality here?",
+    }
+
+    base_question = fallback_map.get(
+        key,
+        f"What can you tell me about {target_field['description'].lower()}?",
+    )
+
+    if user_text:
+        shortened = user_text.replace("\n", " ").strip()
+        if len(shortened) > 120:
+            shortened = shortened[:117].rstrip() + "..."
+
+        anchored_templates = {
+            "project_purpose": f"You mentioned '{shortened}'. What is the overall outcome this project is trying to achieve?",
+            "current_stage": f"Based on what you just said — '{shortened}' — where is the project up to right now?",
+            "phase_goal": f"You mentioned '{shortened}'. What is the main goal of the current phase?",
+            "definition_of_done": f"From what you just said — '{shortened}' — what would a successful result look like for this phase?",
+            "current_workflow": f"You mentioned '{shortened}'. How does this workflow currently run from start to finish?",
+            "tools_used": f"You mentioned '{shortened}'. What tools or platforms are already part of that process?",
+            "desired_outputs": f"You mentioned '{shortened}'. What outputs do you want the agent to help create from that?",
+            "current_constraints": f"You mentioned '{shortened}'. What constraints or limits do I need to respect here?",
+            "risks_or_blockers": f"You mentioned '{shortened}'. What is the main thing making this harder or slowing it down?",
+        }
+
+        if key in anchored_templates:
+            return anchored_templates[key]
+
+    return base_question
 
 
 def _generate_module_summary(module: dict) -> str:
-    qa_lines = []
-    for answer in module["answers"]:
-        qa_lines.append(f"Q: {answer['question_text']}\nA: {_combine_answer_record(answer)}")
+    field_lines = []
+    for field in module["required_fields"]:
+        if field.get("value"):
+            field_lines.append(f"{field['description']}: {field['value']}")
 
     prompt = f"""
 You are summarising one onboarding module.
 
 Module: {module['title']}
 
-Questions and answers:
-{chr(10).join(qa_lines)}
+Collected field values:
+{chr(10).join(field_lines)}
 
 Rules:
 - Be concise.
 - Be factual.
 - Stay close to the user's wording.
 - Do not invent detail.
-- Do not over-interpret.
 - Output plain text only.
 """.strip()
 
@@ -418,86 +898,100 @@ Rules:
 
 def _write_onboarding_files(session: dict) -> None:
     os.makedirs(MEMORY_DIR, exist_ok=True)
-
     modules = {module["key"]: module for module in session["modules"]}
 
-    founder = modules["founder_profile"]
-    goals = modules["goals"]
-    current_focus = modules["current_focus"]
-    help_preferences = modules["help_preferences"]
-
-    founder_answers = {a["question_key"]: _combine_answer_record(a) for a in founder["answers"]}
-    goals_answers = {a["question_key"]: _combine_answer_record(a) for a in goals["answers"]}
-    current_answers = {a["question_key"]: _combine_answer_record(a) for a in current_focus["answers"]}
-    help_answers = {a["question_key"]: _combine_answer_record(a) for a in help_preferences["answers"]}
+    def get_field(module_key: str, field_key: str) -> str:
+        module = modules[module_key]
+        for field in module["required_fields"]:
+            if field["key"] == field_key:
+                return field.get("value", "")
+        return ""
 
     _write_file(
-        "founder-profile.md",
-        f"""# Founder Profile
+        "project-definition.md",
+        f"""# Project Definition
 
-## Name
-{founder_answers.get('name', '')}
+## Project Name
+{get_field("project_definition", "project_name")}
 
-## Current Situation
-{founder_answers.get('current_situation', '')}
+## Project Purpose
+{get_field("project_definition", "project_purpose")}
 
-## Strengths
-- {founder_answers.get('strengths', '')}
+## Current Stage
+{get_field("project_definition", "current_stage")}
 
-## Struggles
-- {founder_answers.get('struggles', '')}
-
-## Identity Direction
-{founder_answers.get('identity_direction', '')}
-"""
+## Why It Matters
+{get_field("project_definition", "why_it_matters")}
+""",
     )
 
     _write_file(
-        "goals.md",
-        f"""# Goals
+        "current-objective.md",
+        f"""# Current Objective
 
-## Top Goals
-1. {goals_answers.get('top_goals', '')}
+## Phase Goal
+{get_field("current_objective", "phase_goal")}
 
-## 12-Month Outcome
-{goals_answers.get('twelve_month_outcome', '')}
+## Definition of Done
+{get_field("current_objective", "definition_of_done")}
 
-## What Matters Most Now
-{goals_answers.get('what_matters_now', '')}
-"""
+## Key Deliverables
+{get_field("current_objective", "key_deliverables")}
+
+## Next Move
+{get_field("current_objective", "next_move")}
+""",
     )
 
     _write_file(
-        "current-focus.md",
-        f"""# Current Focus
+        "workflow-context.md",
+        f"""# Workflow Context
 
-## Active Work
-{current_answers.get('active_work', '')}
+## Current Workflow
+{get_field("workflow_context", "current_workflow")}
 
-## Weekly Priorities
-1. {current_answers.get('weekly_priorities', '')}
+## Tools Used
+{get_field("workflow_context", "tools_used")}
 
-## Current Bottleneck
-{current_answers.get('current_bottleneck', '')}
-"""
+## Key Inputs
+{get_field("workflow_context", "key_inputs")}
+
+## Desired Outputs
+{get_field("workflow_context", "desired_outputs")}
+""",
     )
 
     _write_file(
-        "help-preferences.md",
-        f"""# Help Preferences
+        "constraints.md",
+        f"""# Constraints
 
-## Advice Style
-{help_answers.get('advice_style', '')}
+## Current Constraints
+{get_field("constraints", "current_constraints")}
+
+## Out of Scope
+{get_field("constraints", "out_of_scope")}
+
+## Risks or Blockers
+{get_field("constraints", "risks_or_blockers")}
+""",
+    )
+
+    _write_file(
+        "support-preferences.md",
+        f"""# Support Preferences
+
+## Support Role
+{get_field("support_preferences", "support_role")}
 
 ## Response Style
-{help_answers.get('response_style', '')}
+{get_field("support_preferences", "response_style")}
 
 ## Challenge Level
-{help_answers.get('challenge_level', '')}
+{get_field("support_preferences", "challenge_level")}
 
-## Preferred Support
-{help_answers.get('preferred_support', '')}
-"""
+## Optimisation Priority
+{get_field("support_preferences", "optimisation_priority")}
+""",
     )
 
 
