@@ -1,4 +1,5 @@
 import os
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from dotenv import load_dotenv
@@ -15,9 +16,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update.message is None:
         return
 
-    await update.message.reply_text(
-        "AI-fie Telegram is connected. Send me a message and I will route it through the system."
-    )
+    try:
+        await update.message.reply_text(
+            "AI-fie Telegram is connected. Send me a message and I will route it through the system.",
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=20,
+            pool_timeout=30,
+        )
+    except Exception as error:
+        debug_log(f"[TELEGRAM] Error while sending /start reply: {error}")
 
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -29,16 +37,37 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     debug_log("[TELEGRAM] ===== New Telegram message received =====")
     debug_log(f"[TELEGRAM] Message: {user_message}")
 
+    reply = "Something went wrong while processing your message."
+
     try:
-        reply = handle_chat_message(
+        # Run blocking orchestrator off the async event loop
+        reply = await asyncio.to_thread(
+            handle_chat_message,
             source="telegram",
             message=user_message
         )
+
+        debug_log(f"[TELEGRAM] Reply generated: {reply}")
+
     except Exception as error:
         debug_log(f"[TELEGRAM] Error while handling message: {error}")
-        reply = "Something went wrong while processing your message."
 
-    await update.message.reply_text(reply)
+    try:
+        await update.message.reply_text(
+            str(reply),
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=20,
+            pool_timeout=30,
+        )
+        debug_log("[TELEGRAM] Reply sent successfully")
+
+    except Exception as error:
+        debug_log(f"[TELEGRAM] Error while sending reply to Telegram: {error}")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    debug_log(f"[TELEGRAM] Unhandled bot error: {context.error}")
 
 
 def main() -> None:
@@ -50,7 +79,10 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message)
+    )
+    application.add_error_handler(error_handler)
 
     debug_log("[TELEGRAM] Bot is now polling for messages...")
     application.run_polling()
